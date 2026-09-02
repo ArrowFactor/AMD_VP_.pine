@@ -1,0 +1,369 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+strategy("AMD Volume Profile Distribution Strategy", overlay = true, initial_capital = 1000000, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0, process_orders_on_close = true, max_boxes_count = 500, max_lines_count = 100, max_labels_count = 500)
+
+// --- Constants ---
+string GROUP_AMD = "AMD Detection"
+string GROUP_PROFILE = "Volume Profile"
+string GROUP_TRADE = "Trade Management"
+string GROUP_TIME = "Trading Hours"
+string GROUP_FILTER = "EMA Filter"
+string GROUP_STYLE = "Style"
+
+// --- Inputs ---
+int accumulationLookbackInput = input.int(60, "Accumulation lookback", minval = 10, maxval = 500, group = GROUP_AMD, tooltip = "Number of 1-minute bars used to identify and profile an accumulation range.")
+int minimumAccumulationBarsInput = input.int(20, "Minimum quiet bars", minval = 5, maxval = 500, group = GROUP_AMD, tooltip = "Minimum number of bars inside the low-range condition before an accumulation can be accepted.")
+int atrLengthInput = input.int(14, "ATR length", minval = 1, group = GROUP_AMD, tooltip = "ATR length used to measure whether the market is compressed enough to be accumulation.")
+float maximumRangeAtrInput = input.float(5.0, "Maximum range in ATRs", minval = 0.1, step = 0.1, group = GROUP_AMD, tooltip = "The rolling accumulation range must be no larger than this multiple of ATR.")
+int volumeAverageLengthInput = input.int(30, "Volume average length", minval = 1, group = GROUP_AMD, tooltip = "Length used to compare current accumulation volume with average volume.")
+bool useVolumeFilterInput = input.bool(false, "Use accumulation volume filter", group = GROUP_AMD, tooltip = "When enabled, accumulation requires the selected maximum volume ratio. Disable it for symbols with inconsistent or unavailable volume data.")
+float maximumAccumulationVolumeInput = input.float(2.0, "Maximum accumulation volume ratio", minval = 0.1, step = 0.05, group = GROUP_AMD, tooltip = "Accumulation bars are accepted when volume is below this multiple of average volume.")
+float breakoutBufferInput = input.float(0.0, "Breakout buffer (% of range)", minval = 0.0, step = 0.01, group = GROUP_AMD, tooltip = "Extra distance beyond the accumulation edge required for a confirmed breakout entry.")
+string tradeDirectionInput = input.string("Both", "Trade direction", options = ["Both", "Long only", "Short only"], group = GROUP_AMD, tooltip = "Restrict the strategy to long trades, short trades, or both directions.")
+
+bool useNoLongsBelowEmaInput = input.bool(false, "No longs below EMA", group = GROUP_FILTER, tooltip = "When enabled, long trades are allowed only when price is above the selected long-filter EMA.")
+int longEmaLengthInput = input.int(200, "Long-filter EMA length", minval = 1, group = GROUP_FILTER, tooltip = "EMA length used by the no-longs-below-EMA filter.")
+bool useNoShortsAboveEmaInput = input.bool(false, "No shorts above EMA", group = GROUP_FILTER, tooltip = "When enabled, short trades are allowed only when price is below the selected short-filter EMA.")
+int shortEmaLengthInput = input.int(200, "Short-filter EMA length", minval = 1, group = GROUP_FILTER, tooltip = "EMA length used by the no-shorts-above-EMA filter.")
+
+int profileBinsInput = input.int(24, "Profile rows", minval = 5, maxval = 80, group = GROUP_PROFILE, tooltip = "Number of price rows used by the volume profile.")
+int profileWidthInput = input.int(25, "Profile width", minval = 2, maxval = 100, group = GROUP_PROFILE, tooltip = "Maximum horizontal width of the profile in bars.")
+
+float positionSizeInput = input.float(1.0, "Position size", minval = 0.0, step = 0.01, group = GROUP_TRADE, tooltip = "Fixed quantity submitted for each trade.")
+string exitModeInput = input.string("Price distance", "TP/SL calculation", options = ["Price distance", "Percent", "ATR multiple"], group = GROUP_TRADE, tooltip = "Choose whether TP and SL inputs are price units, percentages, or ATR multiples.")
+float takeProfitInput = input.float(100.0, "Take-profit value", minval = 0.0, step = 0.01, group = GROUP_TRADE, tooltip = "Manual TP distance in price units, percent, or ATR multiples depending on the calculation mode.")
+float stopLossInput = input.float(50.0, "Stop-loss value", minval = 0.0, step = 0.01, group = GROUP_TRADE, tooltip = "Manual SL distance in price units, percent, or ATR multiples depending on the calculation mode.")
+float entryTriggerPercentInput = input.float(0.0, "Entry trigger (% of SL)", minval = 0.0, maxval = 99.0, step = 1.0, group = GROUP_TRADE, tooltip = "Places a limit entry this percentage of the selected SL distance away from the original breakout price. 0% preserves the original immediate entry.")
+
+string tradingSessionInput = input.session("0000-2359", "Trading session", group = GROUP_TIME, tooltip = "Only confirmations occurring inside this session are allowed to open a trade. Change this to the hours you want to trade.")
+string timezoneInput = input.string("America/New_York", "Session timezone", options = ["America/New_York", "Europe/London", "Asia/Tokyo", "Etc/UTC"], group = GROUP_TIME, tooltip = "Timezone used to interpret the trading session.")
+bool useExchangeTimezoneInput = input.bool(false, "Use exchange timezone", group = GROUP_TIME, tooltip = "When enabled, the symbol exchange timezone is used instead of the selected timezone.")
+
+bool showAccumulationInput = input.bool(true, "Show accumulation box", group = GROUP_STYLE, tooltip = "Display the accepted accumulation range.")
+bool showProfileInput = input.bool(true, "Show volume profile", group = GROUP_STYLE, tooltip = "Display the volume profile rows and POC for the accepted accumulation.")
+bool showTradeBoxesInput = input.bool(true, "Show TP/SL boxes", group = GROUP_STYLE, tooltip = "Display green TP and red SL boxes while a trade is active.")
+color accumulationColorInput = input.color(color.new(#5b9cf6, 86), "Accumulation color", group = GROUP_STYLE)
+color pocColorInput = input.color(#f2c94c, "POC color", group = GROUP_STYLE)
+color targetColorInput = input.color(color.new(#089981, 78), "TP box color", group = GROUP_STYLE)
+color stopColorInput = input.color(color.new(#f23645, 78), "SL box color", group = GROUP_STYLE)
+bool showStopMilestonesInput = input.bool(true, "Show SL percentage arrows", group = GROUP_STYLE, tooltip = "Display arrows at 25%, 50%, and 75% of the stop-loss distance inside the SL side of each trade box.")
+color stopMilestoneColorInput = input.color(#f2c94c, "SL percentage arrow color", group = GROUP_STYLE, tooltip = "Color used for the 25%, 50%, and 75% stop-loss arrows.")
+string stopMilestoneSizeInput = input.string("Small", "SL percentage arrow size", options = ["Micro", "Tiny", "Small", "Normal", "Large", "Huge"], group = GROUP_STYLE, tooltip = "Size used for the 25%, 50%, and 75% stop-loss arrows. Micro is smaller than Tiny.")
+bool showStatsInput = input.bool(true, "Show performance box", group = GROUP_STYLE, tooltip = "Display live strategy performance statistics in a chart table.")
+string statsPositionInput = input.string("Top right", "Performance box position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = GROUP_STYLE, tooltip = "Choose where the performance box is displayed.")
+string performanceBoxSizeInput = input.string("Small", "Performance box size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = GROUP_STYLE, tooltip = "Adjust the text and overall visual size of the performance box.")
+int maximumAccumulationBoxesInput = input.int(10, "Maximum accumulation boxes", minval = 1, maxval = 100, group = GROUP_STYLE, tooltip = "Maximum number of historical accumulation range boxes retained on the chart.")
+int maximumTradeBoxSetsInput = input.int(5, "Maximum trade box sets", minval = 1, maxval = 50, group = GROUP_STYLE, tooltip = "Maximum number of historical TP/SL box pairs retained on the chart.")
+
+// --- Functions ---
+f_binIndex(float price, float rangeLow, float rangeHigh, int bins) =>
+    float span = math.max(rangeHigh - rangeLow, syminfo.mintick)
+    int index = int(math.floor((price - rangeLow) / span * bins))
+    math.max(0, math.min(bins - 1, index))
+
+f_exitDistance(float entryPrice, float value, string mode, float atrValue) =>
+    switch mode
+        "Percent" => entryPrice * value / 100.0
+        "ATR multiple" => atrValue * value
+        => value
+
+f_profilePrice() =>
+    (high + low + close) / 3.0
+
+f_tablePosition(string location) =>
+    switch location
+        "Top left" => position.top_left
+        "Bottom right" => position.bottom_right
+        "Bottom left" => position.bottom_left
+        => position.top_right
+
+f_labelSize(string arrowSizeInput) =>
+    switch arrowSizeInput
+        "Micro" => 1
+        "Tiny" => 2
+        "Small" => 3
+        "Normal" => 4
+        "Large" => 5
+        => 6
+
+f_tableTextSize(string tableSizeInput) =>
+    switch tableSizeInput
+        "Tiny" => size.tiny
+        "Normal" => size.normal
+        "Large" => size.large
+        "Huge" => size.huge
+        => size.small
+
+// --- Core calculations ---
+float atrValue = ta.atr(atrLengthInput)
+float volumeAverage = ta.sma(volume, volumeAverageLengthInput)
+float volumeRatio = not na(volumeAverage) and volumeAverage > 0.0 ? volume / volumeAverage : 1.0
+float rollingHigh = ta.highest(high, accumulationLookbackInput)
+float rollingLow = ta.lowest(low, accumulationLookbackInput)
+float rollingRange = rollingHigh - rollingLow
+float quietBarCount = ta.sma((not na(atrValue) and rollingRange <= atrValue * maximumRangeAtrInput and (not useVolumeFilterInput or volumeRatio <= maximumAccumulationVolumeInput)) ? 1.0 : 0.0, accumulationLookbackInput) * accumulationLookbackInput
+bool accumulationReady = not na(atrValue) and not na(rollingRange) and quietBarCount >= minimumAccumulationBarsInput and rollingRange > syminfo.mintick
+string sessionTimezone = useExchangeTimezoneInput ? syminfo.timezone : timezoneInput
+bool insideTradingSession = not na(time(timeframe.period, tradingSessionInput, sessionTimezone))
+bool oneMinuteChart = timeframe.isminutes and timeframe.multiplier == 1
+float longEmaValue = ta.ema(close, longEmaLengthInput)
+float shortEmaValue = ta.ema(close, shortEmaLengthInput)
+float vwapValue = ta.vwap(hlc3)
+bool longEmaCondition = not useNoLongsBelowEmaInput or close > longEmaValue
+bool shortEmaCondition = not useNoShortsAboveEmaInput or close < shortEmaValue
+
+// --- Persistent state ---
+var bool accumulationActive = false
+var int phase = 0 // 0 = searching, 1 = accumulation
+var int accumulationStartBar = na
+var int accumulationEndBar = na
+var float accumulationHigh = na
+var float accumulationLow = na
+var float activePoc = na
+var float lockedHigh = na
+var float lockedLow = na
+var float entryPrice = na
+var float activeTakeProfit = na
+var float activeStopLoss = na
+var bool pendingEntry = false
+var box accumulationBox = na
+var box targetBox = na
+var box stopBox = na
+var label stop25Dot = na
+var label stop50Dot = na
+var label stop75Dot = na
+var line pocLine = na
+var array<float> profileVolumes = array.new_float()
+var array<box> profileBoxArray = array.new_box()
+var array<box> accumulationBoxArray = array.new_box()
+var array<box> tradeBoxArray = array.new_box()
+var array<label> stopDotArray = array.new_label()
+
+bool lockEvent = false
+bool longSignal = false
+bool shortSignal = false
+
+// --- Start and build accumulation ---
+if not accumulationActive and phase == 0 and strategy.position_size == 0 and not pendingEntry and accumulationReady
+    accumulationActive := true
+    phase := 1
+    accumulationStartBar := math.max(0, bar_index - accumulationLookbackInput + 1)
+    accumulationEndBar := bar_index
+    accumulationHigh := rollingHigh
+    accumulationLow := rollingLow
+    array.clear(profileVolumes)
+    for profileBin = 0 to profileBinsInput - 1
+        array.push(profileVolumes, 0.0)
+    for profileOffset = 0 to accumulationLookbackInput - 1
+        if bar_index >= profileOffset
+            float historicalPrice = f_profilePrice()[profileOffset]
+            if historicalPrice >= accumulationLow and historicalPrice <= accumulationHigh
+                int historicalIndex = f_binIndex(historicalPrice, accumulationLow, accumulationHigh, profileBinsInput)
+                array.set(profileVolumes, historicalIndex, array.get(profileVolumes, historicalIndex) + nz(volume[profileOffset]))
+    accumulationBox := na
+    if showAccumulationInput
+        accumulationBox := box.new(left = accumulationStartBar, top = accumulationHigh, right = accumulationEndBar, bottom = accumulationLow, xloc = xloc.bar_index, bgcolor = accumulationColorInput, border_color = color.new(#5b9cf6, 35), border_width = 1)
+        array.push(accumulationBoxArray, accumulationBox)
+        while array.size(accumulationBoxArray) > maximumAccumulationBoxesInput
+            box oldestAccumulationBox = array.shift(accumulationBoxArray)
+            box.delete(oldestAccumulationBox)
+
+if accumulationActive
+    accumulationEndBar := bar_index
+    if bar_index > accumulationStartBar + accumulationLookbackInput - 1
+        float currentPrice = f_profilePrice()
+        if currentPrice >= accumulationLow and currentPrice <= accumulationHigh
+            int currentIndex = f_binIndex(currentPrice, accumulationLow, accumulationHigh, profileBinsInput)
+            array.set(profileVolumes, currentIndex, array.get(profileVolumes, currentIndex) + nz(volume))
+    if not na(accumulationBox)
+        box.set_right(accumulationBox, accumulationEndBar)
+        box.set_top(accumulationBox, accumulationHigh)
+        box.set_bottom(accumulationBox, accumulationLow)
+
+    float breakoutDistance = (accumulationHigh - accumulationLow) * breakoutBufferInput
+    bool confirmedBreakBelow = close < accumulationLow - breakoutDistance
+    bool confirmedBreakAbove = close > accumulationHigh + breakoutDistance
+
+    if confirmedBreakBelow
+        accumulationActive := false
+        phase := 0
+        lockEvent := true
+        if insideTradingSession and strategy.position_size == 0 and not pendingEntry and (tradeDirectionInput == "Both" or tradeDirectionInput == "Long only") and longEmaCondition
+            float signalPrice = close
+            float selectedStopDistance = math.max(syminfo.mintick, f_exitDistance(signalPrice, stopLossInput, exitModeInput, atrValue))
+            float triggerPrice = signalPrice - selectedStopDistance * entryTriggerPercentInput / 100.0
+            pendingEntry := true
+            if entryTriggerPercentInput == 0.0
+                strategy.entry("Entry", strategy.long, qty = positionSizeInput)
+            else
+                strategy.entry("Entry", strategy.long, qty = positionSizeInput, limit = triggerPrice)
+            longSignal := true
+    else if confirmedBreakAbove
+        accumulationActive := false
+        phase := 0
+        lockEvent := true
+        if insideTradingSession and strategy.position_size == 0 and not pendingEntry and (tradeDirectionInput == "Both" or tradeDirectionInput == "Short only") and shortEmaCondition
+            float signalPrice = close
+            float selectedStopDistance = math.max(syminfo.mintick, f_exitDistance(signalPrice, stopLossInput, exitModeInput, atrValue))
+            float triggerPrice = signalPrice + selectedStopDistance * entryTriggerPercentInput / 100.0
+            pendingEntry := true
+            if entryTriggerPercentInput == 0.0
+                strategy.entry("Entry", strategy.short, qty = positionSizeInput)
+            else
+                strategy.entry("Entry", strategy.short, qty = positionSizeInput, limit = triggerPrice)
+            shortSignal := true
+
+// --- Lock the volume profile after the accumulation breaks ---
+if lockEvent
+    lockedHigh := accumulationHigh
+    lockedLow := accumulationLow
+    accumulationEndBar := bar_index
+    float lockedRange = math.max(lockedHigh - lockedLow, syminfo.mintick)
+    float lockedBinSize = lockedRange / profileBinsInput
+    float maximumProfileVolume = 0.0
+    float pocVolume = -1.0
+    int pocIndex = 0
+    for profileBin = 0 to profileBinsInput - 1
+        float binVolume = array.get(profileVolumes, profileBin)
+        maximumProfileVolume := math.max(maximumProfileVolume, binVolume)
+        if binVolume > pocVolume
+            pocVolume := binVolume
+            pocIndex := profileBin
+    activePoc := lockedLow + (pocIndex + 0.5) * lockedBinSize
+
+    if not na(pocLine)
+        line.delete(pocLine)
+    if showProfileInput
+        pocLine := line.new(x1 = accumulationStartBar, y1 = activePoc, x2 = bar_index + profileWidthInput, y2 = activePoc, xloc = xloc.bar_index, color = pocColorInput, style = line.style_dashed, width = 2)
+    if array.size(profileBoxArray) > 0
+        for profileBoxIndex = 0 to array.size(profileBoxArray) - 1
+            box.delete(array.get(profileBoxArray, profileBoxIndex))
+        array.clear(profileBoxArray)
+    if showProfileInput and maximumProfileVolume > 0.0
+        for profileBin = 0 to profileBinsInput - 1
+            float binVolume = array.get(profileVolumes, profileBin)
+            if binVolume > 0.0
+                int profileBarWidth = math.max(1, int(math.round(profileWidthInput * binVolume / maximumProfileVolume)))
+                int profileLeft = math.max(accumulationStartBar, accumulationEndBar - profileBarWidth)
+                float profileBottom = lockedLow + profileBin * lockedBinSize
+                float profileTop = profileBottom + lockedBinSize
+                array.push(profileBoxArray, box.new(left = profileLeft, top = profileTop, right = accumulationEndBar, bottom = profileBottom, xloc = xloc.bar_index, bgcolor = color.new(#5b9cf6, 72), border_color = color.new(#5b9cf6, 92), border_width = 1))
+
+// --- TP/SL levels and trade boxes ---
+bool newLongPosition = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool newShortPosition = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if newLongPosition or newShortPosition
+    entryPrice := strategy.position_avg_price
+    float targetDistance = math.max(syminfo.mintick, f_exitDistance(entryPrice, takeProfitInput, exitModeInput, atrValue))
+    float stopDistance = math.max(syminfo.mintick, f_exitDistance(entryPrice, stopLossInput, exitModeInput, atrValue))
+    if newLongPosition
+        activeTakeProfit := entryPrice + targetDistance
+        activeStopLoss := entryPrice - stopDistance
+    else
+        activeTakeProfit := entryPrice - targetDistance
+        activeStopLoss := entryPrice + stopDistance
+    pendingEntry := false
+    if showTradeBoxesInput
+        if newLongPosition
+            targetBox := box.new(left = bar_index, top = activeTakeProfit, right = bar_index, bottom = entryPrice, xloc = xloc.bar_index, bgcolor = targetColorInput, border_color = color.new(#089981, 20), border_width = 1)
+            stopBox := box.new(left = bar_index, top = entryPrice, right = bar_index, bottom = activeStopLoss, xloc = xloc.bar_index, bgcolor = stopColorInput, border_color = color.new(#f23645, 20), border_width = 1)
+        else
+            targetBox := box.new(left = bar_index, top = entryPrice, right = bar_index, bottom = activeTakeProfit, xloc = xloc.bar_index, bgcolor = targetColorInput, border_color = color.new(#089981, 20), border_width = 1)
+            stopBox := box.new(left = bar_index, top = activeStopLoss, right = bar_index, bottom = entryPrice, xloc = xloc.bar_index, bgcolor = stopColorInput, border_color = color.new(#f23645, 20), border_width = 1)
+        array.push(tradeBoxArray, targetBox)
+        array.push(tradeBoxArray, stopBox)
+        while array.size(tradeBoxArray) > maximumTradeBoxSetsInput * 2
+            box oldestTradeBox = array.shift(tradeBoxArray)
+            box.delete(oldestTradeBox)
+        if showStopMilestonesInput
+            float stop25Price = newLongPosition ? entryPrice - stopDistance * 0.25 : entryPrice + stopDistance * 0.25
+            float stop50Price = newLongPosition ? entryPrice - stopDistance * 0.50 : entryPrice + stopDistance * 0.50
+            float stop75Price = newLongPosition ? entryPrice - stopDistance * 0.75 : entryPrice + stopDistance * 0.75
+            stop25Dot := label.new(x = bar_index, y = stop25Price, xloc = xloc.bar_index, yloc = yloc.price, style = newLongPosition ? label.style_arrowdown : label.style_arrowup, color = stopMilestoneColorInput, text = "", textcolor = stopMilestoneColorInput, size = f_labelSize(stopMilestoneSizeInput))
+            stop50Dot := label.new(x = bar_index, y = stop50Price, xloc = xloc.bar_index, yloc = yloc.price, style = newLongPosition ? label.style_arrowdown : label.style_arrowup, color = stopMilestoneColorInput, text = "", textcolor = stopMilestoneColorInput, size = f_labelSize(stopMilestoneSizeInput))
+            stop75Dot := label.new(x = bar_index, y = stop75Price, xloc = xloc.bar_index, yloc = yloc.price, style = newLongPosition ? label.style_arrowdown : label.style_arrowup, color = stopMilestoneColorInput, text = "", textcolor = stopMilestoneColorInput, size = f_labelSize(stopMilestoneSizeInput))
+            array.push(stopDotArray, stop25Dot)
+            array.push(stopDotArray, stop50Dot)
+            array.push(stopDotArray, stop75Dot)
+            while array.size(stopDotArray) > maximumTradeBoxSetsInput * 3
+                label oldestStopDot = array.shift(stopDotArray)
+                label.delete(oldestStopDot)
+
+if strategy.position_size > 0 and not na(activeStopLoss) and not na(activeTakeProfit)
+    strategy.exit("Exit", from_entry = "Entry", stop = activeStopLoss, limit = activeTakeProfit)
+    if not na(targetBox)
+        box.set_right(targetBox, bar_index)
+    if not na(stopBox)
+        box.set_right(stopBox, bar_index)
+else if strategy.position_size < 0 and not na(activeStopLoss) and not na(activeTakeProfit)
+    strategy.exit("Exit", from_entry = "Entry", stop = activeStopLoss, limit = activeTakeProfit)
+    if not na(targetBox)
+        box.set_right(targetBox, bar_index)
+    if not na(stopBox)
+        box.set_right(stopBox, bar_index)
+
+if strategy.position_size != 0
+    if not na(stop25Dot)
+        label.set_x(stop25Dot, bar_index)
+    if not na(stop50Dot)
+        label.set_x(stop50Dot, bar_index)
+    if not na(stop75Dot)
+        label.set_x(stop75Dot, bar_index)
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    if not na(targetBox)
+        box.set_right(targetBox, bar_index)
+    if not na(stopBox)
+        box.set_right(stopBox, bar_index)
+    if not na(stop25Dot)
+        label.set_x(stop25Dot, bar_index)
+    if not na(stop50Dot)
+        label.set_x(stop50Dot, bar_index)
+    if not na(stop75Dot)
+        label.set_x(stop75Dot, bar_index)
+    entryPrice := na
+    activeTakeProfit := na
+    activeStopLoss := na
+
+// --- Visual signals and warnings ---
+plot(useNoLongsBelowEmaInput ? longEmaValue : na, title = "Long Filter EMA", color = #089981, linewidth = 2)
+plot(useNoShortsAboveEmaInput ? shortEmaValue : na, title = "Short Filter EMA", color = #f23645, linewidth = 2)
+plot(vwapValue, title = "VWAP", color = #5b9cf6, linewidth = 2)
+plotshape(longSignal, title = "Entry", style = shape.labelup, location = location.belowbar, color = #089981, text = "Entry", textcolor = chart.fg_color, size = size.tiny)
+plotshape(shortSignal, title = "Entry", style = shape.labeldown, location = location.abovebar, color = #f23645, text = "Entry", textcolor = chart.fg_color, size = size.tiny)
+bgcolor(not oneMinuteChart ? color.new(#f23645, 93) : na, title = "One-minute warning")
+alertcondition(longSignal, "AMD bullish distribution", "AMD bullish distribution confirmation")
+alertcondition(shortSignal, "AMD bearish distribution", "AMD bearish distribution confirmation")
+
+// --- Performance box ---
+var table performanceTable = table.new(f_tablePosition(statsPositionInput), 2, 13, bgcolor = color.new(chart.bg_color, 8), frame_color = color.new(chart.fg_color, 65), frame_width = 1, border_color = color.new(chart.fg_color, 85), border_width = 1)
+
+if barstate.islast
+    if showStatsInput
+        float netReturn = strategy.initial_capital != 0.0 ? strategy.netprofit / strategy.initial_capital * 100.0 : 0.0
+        float winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : 0.0
+        float profitFactor = strategy.grossloss != 0.0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+        float averageTrade = strategy.closedtrades > 0 ? strategy.netprofit / strategy.closedtrades : 0.0
+        color netColor = strategy.netprofit >= 0.0 ? #089981 : #f23645
+        color openColor = strategy.openprofit >= 0.0 ? #089981 : #f23645
+        string positionText = strategy.position_size != 0.0 ? "Entry" : "Flat"
+        string stateText = phase == 1 ? "Accumulation" : "Searching"
+        string profitFactorText = na(profitFactor) ? "n/a" : str.tostring(profitFactor, "#.##")
+        table.cell(performanceTable, 0, 0, "AMD PERFORMANCE", text_color = chart.fg_color, bgcolor = color.new(#5b9cf6, 65), text_halign = text.align_center)
+        table.cell(performanceTable, 1, 0, "LIVE", text_color = chart.fg_color, bgcolor = color.new(#5b9cf6, 65), text_halign = text.align_center)
+        table.cell(performanceTable, 0, 1, "Net profit", text_color = chart.fg_color, text_halign = text.align_left)
+        table.cell(performanceTable, 1, 1, str.tostring(strategy.netprofit, format.mintick), text_color = netColor, text_halign = text.align_right)
+        table.cell(performanceTable, 0, 2, "Net return", text_color = chart.fg_color, text_halign = text.align_left)
+        table.cell(performanceTable, 1, 2, str.tostring(netReturn, "#.##") + "%", text_color = netColor, text_halign = text.align_right)
+        table.cell(performanceTable, 0, 3, "Closed trades", text_color = chart.fg_color, text_halign = text.align_left)
+        table.cell(performanceTable, 1, 3, str.tostring(strategy.closedtrades), text_color = chart.fg_color, text_halign = text.align_right)
+        table.cell(performanceTable, 0, 4, "Win rate", text_color = chart.fg_color, text_halign = text.align_left)
+        table.cell(performanceTable, 1, 4, str.tostring(winRate, "#.##") + "%", text_color = winRate >= 50.0 ? #089981 : #f23645, text_halign = text.align_right)
+        table.cell(performanceTable, 0, 5, "Profit factor", text_color = chart.fg_color, text_halign = text.align_left)
+        table.cell(performanceTable, 1, 5, profitFactorText, text_color = chart.fg_color, text_halign = text.align_right)
+        table.cell(performanceTable, 0, 6, "Average trade", text_color = chart.fg_color, text_halign = text.align_left)
+        table.cell(performanceTable, 1, 6, str.tostring(averageTrade, format.mintick), text_color = averageTrade >= 0.0 ? #089981 : #f23645, text_halign = text.align_right)
+        table.cell(performanceTable, 0, 7, "Max drawdown", text_color = chart.fg_color, text_halign = text.align_left)
+        table.cell(performanceTable, 1, 7, str.tostring(strategy.max_drawdown, format.mintick), text_color = #f23645, text_halign = text.align_right)
+        table.cell(performanceTable, 0, 8, "Open P
